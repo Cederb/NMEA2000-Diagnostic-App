@@ -10,8 +10,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("NMEA2000 Diagnostics")]
 [assembly: AssemblyDescription("Waveshare USB-CAN-A NMEA2000 bus diagnostics")]
 [assembly: AssemblyProduct("NMEA2000 Diagnostics")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 
 internal static class PortableHost
 {

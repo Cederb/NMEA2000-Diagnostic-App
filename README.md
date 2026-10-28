@@ -11,12 +11,24 @@ The application opens directly as a Windows desktop window. It needs no
 installer, companion scripts, or configuration files. The Waveshare USB driver
 must be installed separately.
 
+![NMEA2000 Diagnostics showing PGNs, source addresses, and receipt ages](docs/screenshots/overview.png)
+
+<details>
+<summary>Device list and raw traffic</summary>
+
+![Claimed device addresses and protocol NAME values](docs/screenshots/claimed-devices.png)
+
+![Raw CAN frames with timestamps and payload bytes](docs/screenshots/raw-frames.png)
+
+</details>
+
 ## Contents
 
 - [Features](#features)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
 - [Connection controls and modes](#connection-controls-and-modes)
+- [Recording traffic](#recording-traffic)
 - [Status indicators](#status-indicators)
 - [Diagnostic views](#diagnostic-views)
 - [Device discovery and NAME values](#device-discovery-and-name-values)
@@ -41,6 +53,7 @@ must be installed separately.
 - Display each claimed address, its 64-bit protocol NAME, and numeric NAME fields.
 - Review source-address activity and the newest **500** raw CAN frames.
 - Clear the captured data while leaving the connection open.
+- Record incoming traffic to a timestamped UTF-8 CSV file for later analysis.
 - Run as a single portable EXE or directly from the PowerShell source.
 
 ## Requirements
@@ -92,8 +105,10 @@ NMEA2000 CAN rate. The app fixes the CAN rate at 250 kbit/s.
 | Adapter baud | Selects the PC-side serial rate; default `2000000` |
 | Mode | Selects Silent or Normal and sends the corresponding configuration while connected |
 | Connect | Opens the serial port and writes the adapter configuration |
-| Disconnect | Closes the serial connection and retains the captured data |
-| Clear Capture | Clears counters, PGNs, devices, source records, raw frames, and the parser buffer |
+| Disconnect | Stops and saves any recording, closes the serial connection, and retains the live capture data |
+| Clear Capture | Clears the live counters and tables; an ongoing recording continues |
+| Record... | Opens a save-file picker and starts recording new incoming frames |
+| Stop | Stops recording and flushes queued rows to disk while live capture continues |
 
 **Silent** requests listen-only CAN operation. **Normal** requests normal CAN
 controller participation, including acknowledgements. The app does not send
@@ -116,6 +131,98 @@ merely because the UI says Disconnected.
 Clearing a live capture does not pause reception. New traffic can repopulate
 the views immediately. Disconnect first to leave the cleared views empty.
 Closing and reopening the app starts a new, empty capture.
+
+## Recording traffic
+
+Recording is available in source/portable builds with file version **1.1.0.0**
+or later. It works with either Silent or Normal mode and adds no CAN messages
+to the bus.
+
+1. Connect to the adapter and confirm that frames are arriving.
+2. Click **Record...** and select a CSV file. The suggested filename includes
+   the current UTC date/time, for example `NMEA2000-20261028-120000-123Z.csv`.
+3. The recording bar shows the state, frame count, elapsed duration, and path.
+   Hover over a shortened path to see it in full.
+4. Click **Stop** to finish the file while continuing to monitor the bus.
+
+Recording begins after the file is selected. It records newly received frames,
+not the history already displayed in the app. It retains all successfully
+logged frames, independently of the live raw view's 500-frame limit.
+
+**Clear Capture** does not reset the recording's elapsed time or count, erase
+the file, or discard an in-progress receive packet while recording. Changing
+CAN mode is reflected in subsequent log rows. Disconnecting, a serial-read
+failure, or closing the window stops recording and flushes pending rows. The
+window waits for the recording to finish before closing.
+
+The file picker asks before overwriting an existing file. Stopping and starting
+again creates a new recording session; files are not appended automatically.
+Recording an idle bus produces a valid header-only CSV.
+
+### CSV format
+
+The file uses UTF-8 without a BOM, comma delimiters, a header row, and quoted
+CSV fields. There is one row per received CAN frame in arrival order.
+Numbers use an invariant format regardless of the Windows regional settings.
+
+| Column | Meaning |
+| --- | --- |
+| `timestamp_utc` | PC receipt/parse time in ISO 8601 UTC, including the date and a `Z` suffix |
+| `elapsed_seconds` | Seconds since this recording started, with six decimal places |
+| `adapter_port` | Connected COM port |
+| `serial_baud` | PC-to-adapter serial baud rate |
+| `mode` | Selected/requested Silent or Normal mode for this frame |
+| `can_id` | Complete CAN identifier as an eight-digit hexadecimal value prefixed by `0x` |
+| `frame_type` | `extended` or `standard` |
+| `remote` | `1` for a remote request frame, otherwise `0` |
+| `priority` | Priority extracted from an extended CAN ID; blank for a standard frame |
+| `pgn` | Decimal PGN; blank for a standard frame |
+| `pgn_description` | Built-in PGN description when known |
+| `source` | Source address for extended frames |
+| `destination` | Destination address for PDU1 traffic or `global` for PDU2 traffic |
+| `dlc` | Received CAN payload length |
+| `data` | Payload bytes as space-separated hexadecimal pairs |
+
+Example:
+
+```csv
+"timestamp_utc","elapsed_seconds","adapter_port","serial_baud","mode","can_id","frame_type","remote","priority","pgn","pgn_description","source","destination","dlc","data"
+"2026-10-28T12:00:00.1234567Z","1.234567","COM3","2000000","Silent","0x18EEFF20","extended","0","6","60928","ISO Address Claim","32","255","8","01 02 03 04 05 06 07 08"
+```
+
+Logs contain raw CAN frames, not reassembled NMEA2000 messages. Timestamps have
+the same PC/serial-buffering limitations as the live view; the number of
+fractional digits is not a claim of hardware timestamp accuracy.
+
+### Further analysis
+
+Open the CSV with your preferred analysis tool, or summarize PGNs in PowerShell:
+
+```powershell
+Import-Csv .\NMEA2000-traffic.csv |
+    Group-Object pgn |
+    Sort-Object Count -Descending |
+    Select-Object Name, Count
+```
+
+To inspect address claims:
+
+```powershell
+Import-Csv .\NMEA2000-traffic.csv |
+    Where-Object { $_.pgn -eq '60928' } |
+    Select-Object timestamp_utc, source, data
+```
+
+### Write errors and buffering
+
+A background writer keeps disk I/O off the capture/UI thread and flushes its
+buffer approximately once per second and when stopped. An abrupt process or
+system failure can still lose recently buffered rows.
+
+If the file becomes unwritable or the bounded 16,384-row queue fills, recording
+stops and the app reports an error rather than silently continuing with a gap.
+Treat that file as a partial recording. Live capture remains available, and a
+new recording can be started after the failed one has finished stopping.
 
 ## Status indicators
 
@@ -239,10 +346,11 @@ still have a working driver capable of accepting the requested rate.
 - No product/model-name decoding from PGN 126996 or configuration information.
 - No active discovery requests, NMEA2000 address claiming, or message transmission.
 - No adapter configuration acknowledgement/readback or CAN controller health reporting.
-- No capture export, recording, replay, persistent history, or automatic reconnect.
+- No recording replay, retroactive export of live history, or automatic reconnect.
 - No stale-device removal, complete claim-conflict tracking, or guaranteed loss detection.
 - No performance guarantee at high bus utilization; serial parsing and UI work share a thread.
-- Only the newest 500 raw frames are retained, and all capture state is in memory.
+- Only the newest 500 raw frames are retained in the live view. Recorded frames
+  persist in the selected CSV; aggregate live state is held in memory.
 
 This version is a traffic and address-claim viewer, not a complete physical-layer
 or NMEA2000 conformance analyzer. The automated checks described below do not
@@ -312,6 +420,19 @@ It also copies the EXE into an isolated folder containing only that file,
 launches it, lets its UI timer run, and checks clean shutdown and a zero exit
 code. Test copies are left under `.build/verification-*/`.
 
+Run the recording tests separately:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build\Test-Recording.ps1
+```
+
+They use synthetic traffic and a simulated adapter to check CSV timestamps,
+locale-independent formatting, escaping, full retention beyond 500 frames,
+clearing during a partial packet, mode changes, stop/disconnect/close behavior,
+file-overwrite protection, empty logs, disk-write failures, and queue overflow.
+They also render the recording UI at the default and minimum window sizes.
+Generated logs and images are left under `.build/recording-tests-*/`.
+
 These checks do not open a physical adapter or validate CAN electrical behavior,
 actual mode switching in firmware, discovery on a live network, or loss-free
 operation under load.
@@ -335,6 +456,9 @@ Get-FileHash .\NMEA2000Diagnostics.exe -Algorithm SHA256
 | Device names look like hexadecimal numbers | NAME is the 64-bit protocol identity; human-readable model names are not decoded |
 | Old devices remain in the list | Records are retained until Clear Capture; the app does not remove inactive devices |
 | A cleared live capture immediately contains rows again | Reception continues while connected; disconnect before clearing to keep it empty |
+| Record is disabled | Connect first, or wait for the previous recording to finish stopping |
+| Recording reports a write error or full queue | Stop using that partial log as a complete capture; check free space and the destination drive, then start a new file |
+| An existing log cannot be replaced | Stop the active recording and close programs holding the destination file open; confirm the overwrite in the file picker |
 | An unplugged adapter does not reconnect automatically | Disconnect, reconnect the hardware, refresh the ports if necessary, and connect again |
 | Windows reports an unrecognized application | The EXE is unsigned; verify its source and compare the SHA-256 checksum published with the release |
 
@@ -350,13 +474,16 @@ text, and whether any frames or decode errors were observed.
 ## Project layout
 
 ```text
-NMEA2000Diagnostics.ps1       Windows Forms UI, serial I/O, parser, and capture state
+NMEA2000Diagnostics.ps1       UI, serial I/O, parser, capture state, and CSV recorder
 Run-NMEA2000Diagnostics.cmd   Source launcher using Windows PowerShell
 Build-Portable.ps1            Portable EXE build script
 build/
   PortableHost.cs             In-process PowerShell host and fatal-error reporting
   app.manifest                Windows compatibility and user-privilege manifest
   Test-Portable.ps1           Embedded-source and isolated-launch verification
+  Test-Recording.ps1          Recording lifecycle, CSV, failure, and layout checks
+  Render-ReadmeScreenshots.ps1  Documentation screenshot generator
+docs/screenshots/            README overview, device list, and raw traffic images
 dist/                        Generated EXE output; ignored by Git
 .build/                      Generated verification copies; ignored by Git
 ```

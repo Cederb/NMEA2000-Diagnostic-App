@@ -239,6 +239,140 @@ public sealed class NativeSerialPort : IDisposable
 "@
 }
 
+if (-not ("CsvTrafficRecorder" -as [type])) {
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Threading;
+
+public sealed class CsvTrafficRecorder : IDisposable
+{
+    private readonly BlockingCollection<string> pending = new BlockingCollection<string>(16384);
+    private readonly StreamWriter writer;
+    private readonly Thread worker;
+    private volatile bool completed;
+    private volatile string error;
+    private long framesWritten;
+    private bool disposed;
+
+    public CsvTrafficRecorder(string path, string header, bool overwrite)
+        : this(new FileStream(path, overwrite ? FileMode.Create : FileMode.CreateNew,
+            FileAccess.Write, FileShare.Read, 65536, FileOptions.SequentialScan), header)
+    {
+    }
+
+    public CsvTrafficRecorder(Stream output, string header)
+    {
+        try
+        {
+            writer = new StreamWriter(output, new UTF8Encoding(false), 65536);
+            writer.NewLine = "\r\n";
+            writer.WriteLine(header);
+            writer.Flush();
+            worker = new Thread(WriteLoop);
+            worker.IsBackground = true;
+            worker.Name = "NMEA2000 CSV recorder";
+            worker.Start();
+        }
+        catch
+        {
+            try { output.Dispose(); } catch { }
+            pending.Dispose();
+            throw;
+        }
+    }
+
+    public bool IsCompleted { get { return completed; } }
+    public bool IsStopping { get { return pending.IsAddingCompleted; } }
+    public string Error { get { return error; } }
+    public long FramesWritten { get { return Interlocked.Read(ref framesWritten); } }
+
+    public bool TryWrite(string row)
+    {
+        if (completed || pending.IsAddingCompleted)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (pending.TryAdd(row))
+            {
+                return true;
+            }
+            StopWithError("The recording queue is full. Recording stopped; the log is incomplete.");
+        }
+        catch (InvalidOperationException)
+        {
+            // A disk error can stop the consumer while the UI is enqueueing a frame.
+        }
+        return false;
+    }
+
+    public void RequestStop()
+    {
+        pending.CompleteAdding();
+    }
+
+    public void StopWithError(string message)
+    {
+        if (error == null)
+        {
+            error = message;
+        }
+        RequestStop();
+    }
+
+    private void WriteLoop()
+    {
+        Stopwatch flushInterval = Stopwatch.StartNew();
+        try
+        {
+            while (!pending.IsCompleted)
+            {
+                string row;
+                if (pending.TryTake(out row, 200))
+                {
+                    writer.WriteLine(row);
+                    Interlocked.Increment(ref framesWritten);
+                }
+                if (flushInterval.ElapsedMilliseconds >= 1000)
+                {
+                    writer.Flush();
+                    flushInterval.Restart();
+                }
+            }
+            writer.Flush();
+        }
+        catch (Exception exception)
+        {
+            StopWithError(exception.Message);
+        }
+        finally
+        {
+            try { writer.Dispose(); }
+            catch (Exception exception) { StopWithError(exception.Message); }
+            completed = true;
+        }
+    }
+
+    public void Dispose()
+    {
+        if (!disposed)
+        {
+            RequestStop();
+            worker.Join();
+            pending.Dispose();
+            disposed = true;
+        }
+    }
+}
+'@
+}
+
 $Script:SerialPort = $null
 $Script:RxBuffer = New-Object 'System.Collections.Generic.List[byte]'
 $Script:Pgns = @{}
@@ -254,6 +388,13 @@ $Script:CurrentMode = "Silent"
 $Script:CurrentPort = ""
 $Script:CurrentBaud = 2000000
 $Script:MaxRawFrames = 500
+$Script:Recorder = $null
+$Script:RecordingPath = ""
+$Script:RecordingStartedUtc = [DateTime]::MinValue
+$Script:RecordingStoppedUtc = [DateTime]::MinValue
+$Script:RecordingFrames = [long]0
+$Script:RecordingError = ""
+$Script:CloseAfterRecording = $false
 
 $Script:PgnNames = @{
     59392  = "ISO Acknowledgement"
@@ -500,6 +641,7 @@ function Set-Footer {
     param([string]$Text)
 
     $footerLabel.Text = $Text
+    $recordingToolTip.SetToolTip($footerLabel, $Text)
 }
 
 function Set-StatusValue {
@@ -510,6 +652,187 @@ function Set-StatusValue {
 
     if ($Script:StatusLabels.ContainsKey($Key)) {
         $Script:StatusLabels[$Key].Text = $Value
+    }
+}
+
+function New-RecordingRecord {
+    param([object]$Frame)
+
+    $record = [ordered]@{
+        timestamp_utc = ""
+        elapsed_seconds = ""
+        adapter_port = ""
+        serial_baud = ""
+        mode = ""
+        can_id = ""
+        frame_type = ""
+        remote = ""
+        priority = ""
+        pgn = ""
+        pgn_description = ""
+        source = ""
+        destination = ""
+        dlc = ""
+        data = ""
+    }
+
+    if ($null -ne $Frame) {
+        $culture = [System.Globalization.CultureInfo]::InvariantCulture
+        $record.timestamp_utc = $Frame.Utc.ToString("o", $culture)
+        $record.elapsed_seconds = ($Frame.Utc - $Script:RecordingStartedUtc).TotalSeconds.ToString("F6", $culture)
+        $record.adapter_port = $Script:CurrentPort
+        $record.serial_baud = $Script:CurrentBaud.ToString($culture)
+        $record.mode = $Script:CurrentMode
+        $record.can_id = "0x{0:X8}" -f [UInt32]$Frame.Id
+        $record.frame_type = $(if ($Frame.Extended) { "extended" } else { "standard" })
+        $record.remote = [string][int]$Frame.Remote
+        $record.priority = [string]$Frame.Priority
+        $record.pgn = [string]$Frame.Pgn
+        $record.pgn_description = [string]$Frame.PgnName
+        $record.source = [string]$Frame.Source
+        $record.destination = [string]$Frame.Destination
+        $record.dlc = [string]$Frame.Length
+        $record.data = [string]$Frame.Data
+    }
+
+    return [pscustomobject]$record
+}
+
+function Update-RecordingControls {
+    $connected = ($null -ne $Script:SerialPort -and $Script:SerialPort.IsOpen)
+    $recordButton.Enabled = $connected -and $null -eq $Script:Recorder -and -not $Script:CloseAfterRecording
+    $stopRecordingButton.Enabled = ($null -ne $Script:Recorder -and -not $Script:Recorder.IsStopping -and -not $Script:Recorder.IsCompleted)
+}
+
+function Update-RecordingStatus {
+    $state = "Not recording"
+    if ($null -ne $Script:Recorder) {
+        $Script:RecordingFrames = $Script:Recorder.FramesWritten
+        if ($Script:Recorder.Error -and $Script:Recorder.Error -ne $Script:RecordingError) {
+            $Script:RecordingError = $Script:Recorder.Error
+            Set-Footer ("Recording error: {0} Live capture remains available." -f $Script:RecordingError)
+        }
+        if ($Script:Recorder.IsStopping -and $Script:RecordingStoppedUtc -eq [DateTime]::MinValue) {
+            $Script:RecordingStoppedUtc = [DateTime]::UtcNow
+        }
+        if ($Script:Recorder.IsCompleted) {
+            $Script:RecordingFrames = $Script:Recorder.FramesWritten
+            $Script:RecordingError = [string]$Script:Recorder.Error
+            $Script:Recorder.Dispose()
+            $Script:Recorder = $null
+            if ($Script:RecordingError) {
+                Set-Footer ("Recording failed: {0} Partial log: {1}" -f $Script:RecordingError, $Script:RecordingPath)
+            }
+            else {
+                Set-Footer ("Recording saved: {0:N0} frames to {1}" -f $Script:RecordingFrames, $Script:RecordingPath)
+            }
+        }
+    }
+
+    if ($null -ne $Script:Recorder) {
+        $state = $(if ($Script:Recorder.IsStopping) { "Stopping" } else { "Recording" })
+    }
+    elseif ($Script:RecordingPath) {
+        $state = $(if ($Script:RecordingError) { "Recording error" } else { "Saved" })
+    }
+
+    $duration = [TimeSpan]::Zero
+    if ($Script:RecordingStartedUtc -ne [DateTime]::MinValue) {
+        $end = $(if ($Script:RecordingStoppedUtc -eq [DateTime]::MinValue) { [DateTime]::UtcNow } else { $Script:RecordingStoppedUtc })
+        $duration = $end - $Script:RecordingStartedUtc
+    }
+    $durationText = "{0:00}:{1:00}:{2:00}" -f [Math]::Floor($duration.TotalHours), $duration.Minutes, $duration.Seconds
+    $recordingStatusLabel.Text = "{0} | {1:N0} frames | {2}" -f $state, $Script:RecordingFrames, $durationText
+    $recordingStatusLabel.ForeColor = $(if ($state -eq "Recording" -or $Script:RecordingError) { [System.Drawing.Color]::Firebrick } else { [System.Drawing.SystemColors]::ControlText })
+    $recordingPathLabel.Text = $Script:RecordingPath
+    $recordingToolTip.SetToolTip($recordingPathLabel, $Script:RecordingPath)
+    Update-RecordingControls
+}
+
+function Start-Recording {
+    param(
+        [string]$Path,
+        [switch]$AllowOverwrite
+    )
+
+    if ($null -ne $Script:Recorder -or $Script:CloseAfterRecording) {
+        Set-Footer "A recording is already active or still stopping."
+        return $false
+    }
+    if ($null -eq $Script:SerialPort -or -not $Script:SerialPort.IsOpen) {
+        Set-Footer "Connect to the adapter before starting a recording."
+        return $false
+    }
+
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path)) {
+            throw "Select a recording file."
+        }
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $csv = @(New-RecordingRecord | ConvertTo-Csv -NoTypeInformation -Delimiter ',')
+        $recorder = New-Object CsvTrafficRecorder($fullPath, [string]$csv[0], [bool]$AllowOverwrite)
+        $Script:Recorder = $recorder
+        $Script:RecordingPath = $fullPath
+        $Script:RecordingStartedUtc = [DateTime]::UtcNow
+        $Script:RecordingStoppedUtc = [DateTime]::MinValue
+        $Script:RecordingFrames = [long]0
+        $Script:RecordingError = ""
+        Update-RecordingStatus
+        Set-Footer ("Recording to {0}" -f $fullPath)
+        return $true
+    }
+    catch {
+        Set-Footer ("Could not start recording: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Select-RecordingFile {
+    $dialog = New-Object System.Windows.Forms.SaveFileDialog
+    $dialog.Title = "Record NMEA2000 traffic"
+    $dialog.Filter = "CSV traffic log (*.csv)|*.csv"
+    $dialog.DefaultExt = "csv"
+    $dialog.AddExtension = $true
+    $dialog.OverwritePrompt = $true
+    $dialog.RestoreDirectory = $true
+    $dialog.InitialDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+    $dialog.FileName = "NMEA2000-{0}.csv" -f [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss-fff'Z'")
+    try {
+        if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+            [void](Start-Recording -Path $dialog.FileName -AllowOverwrite)
+        }
+    }
+    finally {
+        $dialog.Dispose()
+    }
+}
+
+function Stop-Recording {
+    if ($null -ne $Script:Recorder) {
+        $Script:Recorder.RequestStop()
+        if ($Script:RecordingStoppedUtc -eq [DateTime]::MinValue) {
+            $Script:RecordingStoppedUtc = [DateTime]::UtcNow
+        }
+        Update-RecordingStatus
+    }
+}
+
+function Write-RecordingFrame {
+    param([object]$Frame)
+
+    if ($null -eq $Script:Recorder -or $Script:Recorder.IsStopping -or $Script:Recorder.IsCompleted) {
+        return
+    }
+
+    try {
+        $csv = @(New-RecordingRecord -Frame $Frame | ConvertTo-Csv -NoTypeInformation -Delimiter ',')
+        if (-not $Script:Recorder.TryWrite([string]$csv[1])) {
+            Update-RecordingStatus
+        }
+    }
+    catch {
+        $Script:Recorder.StopWithError($_.Exception.Message)
+        Update-RecordingStatus
     }
 }
 
@@ -608,7 +931,7 @@ function Add-Frame {
         }
     }
 
-    [void]$Script:RawFrames.Insert(0, [pscustomobject]@{
+    $frame = [pscustomobject]@{
         Utc = $now
         Id = $CanId
         Extended = $Extended
@@ -620,7 +943,9 @@ function Add-Frame {
         Priority = $decoded.Priority
         Length = $Data.Length
         Data = ConvertTo-HexBytes -Bytes $Data
-    })
+    }
+    Write-RecordingFrame -Frame $frame
+    [void]$Script:RawFrames.Insert(0, $frame)
 
     while ($Script:RawFrames.Count -gt $Script:MaxRawFrames) {
         $Script:RawFrames.RemoveAt($Script:RawFrames.Count - 1)
@@ -716,7 +1041,9 @@ function Poll-Serial {
 }
 
 function Clear-CapturedData {
-    $Script:RxBuffer.Clear()
+    if ($null -eq $Script:Recorder) {
+        $Script:RxBuffer.Clear()
+    }
     $Script:Pgns.Clear()
     $Script:Devices.Clear()
     $Script:Sources.Clear()
@@ -753,6 +1080,7 @@ function Set-ConnectionControls {
     $portCombo.Enabled = -not $connected
     $baudCombo.Enabled = -not $connected
     $refreshPortsButton.Enabled = -not $connected
+    Update-RecordingControls
 }
 
 function Connect-Adapter {
@@ -800,6 +1128,8 @@ function Disconnect-Adapter {
     param([switch]$Quiet)
 
     $pollTimer.Stop()
+    Stop-Recording
+    $Script:RxBuffer.Clear()
 
     if ($null -ne $Script:SerialPort) {
         try {
@@ -839,6 +1169,15 @@ function Update-GridRows {
 }
 
 function Update-Ui {
+    Update-RecordingStatus
+    if ($Script:CloseAfterRecording -and $null -eq $Script:Recorder) {
+        $Script:CloseAfterRecording = $false
+        if ($Script:RecordingError) {
+            [void][System.Windows.Forms.MessageBox]::Show($form, ("Recording failed: {0}`r`nPartial log: {1}" -f $Script:RecordingError, $Script:RecordingPath), "Recording error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        }
+        $form.Close()
+        return
+    }
     $now = [DateTime]::UtcNow
 
     while ($Script:FrameWindow.Count -gt 0) {
@@ -991,9 +1330,10 @@ $form.Size = New-Object System.Drawing.Size(1240, 820)
 $root = New-Object System.Windows.Forms.TableLayoutPanel
 $root.Dock = [System.Windows.Forms.DockStyle]::Fill
 $root.ColumnCount = 1
-$root.RowCount = 4
+$root.RowCount = 5
 [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 52)))
-[void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 118)))
+[void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 38)))
+[void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 170)))
 [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 28)))
 $form.Controls.Add($root)
@@ -1069,16 +1409,55 @@ $clearButton.Width = 104
 $clearButton.Margin = New-Object System.Windows.Forms.Padding(18, 3, 3, 3)
 $controlsPanel.Controls.Add($clearButton)
 
+$recordingPanel = New-Object System.Windows.Forms.TableLayoutPanel
+$recordingPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$recordingPanel.ColumnCount = 4
+$recordingPanel.RowCount = 1
+$recordingPanel.Padding = New-Object System.Windows.Forms.Padding(10, 0, 10, 4)
+[void]$recordingPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 104)))
+[void]$recordingPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 80)))
+[void]$recordingPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 300)))
+[void]$recordingPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+$root.Controls.Add($recordingPanel, 0, 1)
+
+$recordButton = New-Object System.Windows.Forms.Button
+$recordButton.Text = "Record..."
+$recordButton.Dock = [System.Windows.Forms.DockStyle]::Fill
+$recordButton.Enabled = $false
+$recordingPanel.Controls.Add($recordButton, 0, 0)
+
+$stopRecordingButton = New-Object System.Windows.Forms.Button
+$stopRecordingButton.Text = "Stop"
+$stopRecordingButton.Dock = [System.Windows.Forms.DockStyle]::Fill
+$stopRecordingButton.Enabled = $false
+$recordingPanel.Controls.Add($stopRecordingButton, 1, 0)
+
+$recordingStatusLabel = New-Object System.Windows.Forms.Label
+$recordingStatusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$recordingStatusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$recordingStatusLabel.AutoEllipsis = $true
+$recordingPanel.Controls.Add($recordingStatusLabel, 2, 0)
+
+$recordingPathLabel = New-Object System.Windows.Forms.Label
+$recordingPathLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+$recordingPathLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$recordingPathLabel.AutoEllipsis = $true
+$recordingPanel.Controls.Add($recordingPathLabel, 3, 0)
+$recordingToolTip = New-Object System.Windows.Forms.ToolTip
+
 $statusPanel = New-Object System.Windows.Forms.TableLayoutPanel
 $statusPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
 $statusPanel.ColumnCount = 4
 $statusPanel.RowCount = 7
+for ($rowIndex = 0; $rowIndex -lt 7; $rowIndex++) {
+    [void]$statusPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, (100.0 / 7))))
+}
 $statusPanel.Padding = New-Object System.Windows.Forms.Padding(10, 0, 10, 8)
 [void]$statusPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 138)))
 [void]$statusPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50)))
 [void]$statusPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 138)))
 [void]$statusPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 50)))
-$root.Controls.Add($statusPanel, 0, 1)
+$root.Controls.Add($statusPanel, 0, 2)
 
 $Script:StatusLabels = @{}
 $statusItems = @(
@@ -1115,7 +1494,7 @@ for ($i = 0; $i -lt $statusItems.Count; $i++) {
 
 $tabs = New-Object System.Windows.Forms.TabControl
 $tabs.Dock = [System.Windows.Forms.DockStyle]::Fill
-$root.Controls.Add($tabs, 0, 2)
+$root.Controls.Add($tabs, 0, 3)
 
 $pgnTab = New-Object System.Windows.Forms.TabPage
 $pgnTab.Text = "Unique PGNs"
@@ -1182,11 +1561,12 @@ $rawTab.Controls.Add($rawGrid)
 $footerPanel = New-Object System.Windows.Forms.Panel
 $footerPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
 $footerPanel.Padding = New-Object System.Windows.Forms.Padding(10, 3, 10, 0)
-$root.Controls.Add($footerPanel, 0, 3)
+$root.Controls.Add($footerPanel, 0, 4)
 
 $footerLabel = New-Object System.Windows.Forms.Label
 $footerLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
 $footerLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+$footerLabel.AutoEllipsis = $true
 $footerLabel.Text = "Select the Waveshare COM port, choose mode, then connect."
 $footerPanel.Controls.Add($footerLabel)
 
@@ -1203,6 +1583,8 @@ $refreshPortsButton.Add_Click({ Refresh-Ports })
 $connectButton.Add_Click({ Connect-Adapter })
 $disconnectButton.Add_Click({ Disconnect-Adapter })
 $clearButton.Add_Click({ Clear-CapturedData })
+$recordButton.Add_Click({ Select-RecordingFile })
+$stopRecordingButton.Add_Click({ Stop-Recording })
 $modeCombo.Add_SelectedIndexChanged({
     if ($null -ne $Script:SerialPort -and $Script:SerialPort.IsOpen) {
         try {
@@ -1220,7 +1602,15 @@ $modeCombo.Add_SelectedIndexChanged({
 })
 
 $form.Add_FormClosing({
+    param($sender, $eventArgs)
     Disconnect-Adapter -Quiet
+    if ($null -ne $Script:Recorder) {
+        $Script:CloseAfterRecording = $true
+        $eventArgs.Cancel = $true
+        $controlsPanel.Enabled = $false
+        Update-RecordingControls
+        return
+    }
     $uiTimer.Stop()
 })
 

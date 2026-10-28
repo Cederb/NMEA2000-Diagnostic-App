@@ -92,6 +92,7 @@ try {
     Assert-Portable ($modeCombo.SelectedItem -eq "Silent") "Silent mode is not the default."
     Assert-Portable ($baudCombo.SelectedItem -eq "2000000") "The 2 Mbps adapter default was not preserved."
     Assert-Portable ($connectButton.Enabled -and -not $disconnectButton.Enabled) "Initial connection controls are incorrect."
+    Assert-Portable (-not $recordButton.Enabled -and -not $stopRecordingButton.Enabled) "Recording should be disabled until connected."
 
     [byte[]]$silentConfig = New-WaveshareConfigPacket -Mode "Silent"
     [byte[]]$normalConfig = New-WaveshareConfigPacket -Mode "Normal"
